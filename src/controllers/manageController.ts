@@ -1,4 +1,3 @@
-
 import type { Request, Response } from "express";
 import { pool } from "../db";
 import type { RowDataPacket, ResultSetHeader } from "mysql2";
@@ -75,7 +74,7 @@ async function queryOnLeave(
   to: string
 ): Promise<RowDataPacket[]> {
   const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT e.full_name, e.email, d.department_name, t.type_name,
+    `SELECT r.request_id, e.full_name, e.email, d.department_name, t.type_name,
             r.start_date, r.end_date, r.number_of_days, r.reason
      FROM leave_requests r
      JOIN employees e ON e.employee_id = r.employee_id
@@ -165,7 +164,11 @@ async function queryRequests(
             r.start_date, r.end_date, r.number_of_days, r.reason, r.status,
             r.request_date, r.decision_date, r.decision_comment,
             a.full_name AS decided_by,
-            (r.document_path IS NOT NULL) AS has_document
+            (r.document_path IS NOT NULL) AS has_document,
+            COALESCE(
+              (SELECT adj.old_days FROM leave_request_adjustments adj
+               WHERE adj.request_id = r.request_id ORDER BY adj.adjustment_id LIMIT 1),
+              r.number_of_days) AS requested_days
      FROM leave_requests r
      JOIN employees e ON e.employee_id = r.employee_id
      JOIN departments d ON d.department_id = e.department_id

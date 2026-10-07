@@ -45,7 +45,10 @@ if (chosenRole !== "Employee") {
       "INSERT INTO employees (full_name, email, department_id, hire_date) VALUES (?, ?, ?, ?)",
       [fullName, cleanEmail, departmentId, hireDate]
     );
-
+    await conn.query(
+      "UPDATE employees SET employee_code = CONCAT('EMP-', LPAD(?, 4, '0')) WHERE employee_id = ?",
+      [emp.insertId, emp.insertId]
+    );
     const hash = await bcrypt.hash(String(password), 10);
 
     await conn.query(

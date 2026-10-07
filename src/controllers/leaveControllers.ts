@@ -6,6 +6,11 @@ import crypto from "crypto";
 import { pool } from "../db";
 import type { AuthedRequest } from "../middleware/auth";
 
+interface UploadedFile {
+  buffer: Buffer;
+  originalname: string;
+}
+
 // Documents are stored on disk, outside any public folder
 const UPLOAD_DIR = path.join(__dirname, "..", "..", "uploads");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
@@ -16,6 +21,9 @@ const DECIDES: Record<string, string[]> = {
   HR: ["Employee", "Manager"],
   Chief: ["HR", "Chief"],
 };
+
+// Roles allowed to approve fewer days and to change days on approved leave
+const ADJUSTERS: string[] = ["HR"];
 
 function currentUser(req: Request) {
   return (req as AuthedRequest).user!;
@@ -64,6 +72,21 @@ function countWorkingDays(start: string, end: string): number {
   return count;
 }
 
+// The date of the Nth working day, counting from the start date (Monday to Friday)
+function endDateForDays(start: string, days: number): string {
+  const d = new Date(start + "T00:00:00");
+  let counted = 0;
+  for (let guard = 0; guard < 1000; guard++) {
+    const day = d.getDay();
+    if (day !== 0 && day !== 6) {
+      counted++;
+      if (counted === days) return formatDate(d);
+    }
+    d.setDate(d.getDate() + 1);
+  }
+  return formatDate(d);
+}
+
 // Checks the real file content, not the name or the type the browser claims
 function detectFileType(buf: Buffer): { ext: string; mime: string } | null {
   if (buf.length >= 4 && buf.subarray(0, 4).toString("latin1") === "%PDF") {
@@ -82,6 +105,12 @@ function detectFileType(buf: Buffer): { ext: string; mime: string } | null {
 function cleanFileName(name: string): string {
   return name.replace(/[^\w.\- ]/g, "_").slice(0, 100);
 }
+
+// SQL piece: the number of days first requested, before any adjustment
+const REQUESTED_DAYS_SQL = `COALESCE(
+  (SELECT adj.old_days FROM leave_request_adjustments adj
+   WHERE adj.request_id = r.request_id ORDER BY adj.adjustment_id LIMIT 1),
+  r.number_of_days)`;
 
 export async function getLeaveTypes(_req: Request, res: Response): Promise<void> {
   try {
@@ -121,7 +150,8 @@ export async function getMyRequests(req: Request, res: Response): Promise<void> 
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT r.request_id, t.type_name, r.start_date, r.end_date, r.number_of_days,
               r.reason, r.status, r.decision_comment,
-              (r.document_path IS NOT NULL) AS has_document
+              (r.document_path IS NOT NULL) AS has_document,
+              ${REQUESTED_DAYS_SQL} AS requested_days
        FROM leave_requests r
        JOIN leave_types t ON t.leave_type_id = r.leave_type_id
        WHERE r.employee_id = ?
@@ -136,8 +166,8 @@ export async function getMyRequests(req: Request, res: Response): Promise<void> 
 }
 
 export async function createRequest(req: Request, res: Response): Promise<void> {
-  const { leaveTypeId, startDate, endDate, reason } = req.body;
-  const file = (req as Request & { file?: Express.Multer.File }).file;
+  const { leaveTypeId, startDate, endDate, reason } = req.body ?? {};
+  const file = (req as Request & { file?: UploadedFile }).file;
 
   if (!leaveTypeId || !isValidDate(startDate) || !isValidDate(endDate)) {
     res.status(400).json({ message: "Choose a leave type, a start date and an end date." });
@@ -388,7 +418,7 @@ export async function getPending(req: Request, res: Response): Promise<void> {
 }
 
 export async function decideRequest(req: Request, res: Response): Promise<void> {
-  const { decision, comment } = req.body;
+  const { decision, comment, approvedDays } = req.body ?? {};
   if (decision !== "Approved" && decision !== "Rejected") {
     res.status(400).json({ message: "Decision must be Approved or Rejected." });
     return;
@@ -439,13 +469,49 @@ export async function decideRequest(req: Request, res: Response): Promise<void> 
       return;
     }
 
+    // Optional: approve fewer days than requested (HR only)
+    const requestedDays = Number(request.number_of_days);
+    let finalDays = requestedDays;
+    let newEnd: string | null = null;
+    const wantsFewerDays =
+      decision === "Approved" &&
+      approvedDays !== undefined &&
+      approvedDays !== null &&
+      approvedDays !== "";
+    if (wantsFewerDays) {
+      const n = Number(approvedDays);
+      if (!ADJUSTERS.includes(currentUser(req).role)) {
+        await conn.rollback();
+        res.status(403).json({ message: "You are not allowed to approve a different number of days." });
+        return;
+      }
+      if (!Number.isInteger(n) || n < 1 || n > requestedDays) {
+        await conn.rollback();
+        res.status(400).json({
+          message: `The days to approve must be a whole number from 1 to ${requestedDays}.`,
+        });
+        return;
+      }
+      if (n < requestedDays) {
+        if (cleanComment.length < 3) {
+          await conn.rollback();
+          res.status(400).json({
+            message: "Please explain why fewer days are approved (at least 3 characters).",
+          });
+          return;
+        }
+        finalDays = n;
+        newEnd = endDateForDays(String(request.start_date).slice(0, 10), n);
+      }
+    }
+
     if (decision === "Approved") {
       const year = Number(String(request.start_date).slice(0, 4));
       const [upd] = await conn.query<ResultSetHeader>(
         `UPDATE leave_balances SET days_used = days_used + ?
          WHERE employee_id = ? AND leave_type_id = ? AND year = ?
            AND (days_allocated - days_used) >= ?`,
-        [request.number_of_days, request.employee_id, request.leave_type_id, year, request.number_of_days]
+        [finalDays, request.employee_id, request.leave_type_id, year, finalDays]
       );
       if (!upd.affectedRows) {
         await conn.rollback();
@@ -457,13 +523,184 @@ export async function decideRequest(req: Request, res: Response): Promise<void> 
     await conn.query(
       `UPDATE leave_requests
        SET status = ?, approved_by = ?, decision_date = NOW(),
-           decision_comment = ?, seen_by_employee = 0
+           decision_comment = ?, seen_by_employee = 0,
+           number_of_days = ?, end_date = COALESCE(?, end_date)
        WHERE request_id = ?`,
-      [decision, deciderId, cleanComment || null, req.params.id]
+      [decision, deciderId, cleanComment || null, finalDays, newEnd, req.params.id]
+    );
+
+    if (newEnd) {
+      await conn.query(
+        `INSERT INTO leave_request_adjustments
+           (request_id, adjusted_by, old_end_date, new_end_date, old_days, new_days, reason)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [
+          req.params.id,
+          deciderId,
+          String(request.end_date).slice(0, 10),
+          newEnd,
+          requestedDays,
+          finalDays,
+          cleanComment,
+        ]
+      );
+    }
+
+    await conn.commit();
+    res.json({
+      message:
+        decision === "Approved" && finalDays < requestedDays
+          ? `Request approved for ${finalDays} of ${requestedDays} working days.`
+          : `Request ${decision.toLowerCase()}.`,
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+}
+
+// Extend or shorten leave that is already approved (HR only)
+export async function adjustLeave(req: Request, res: Response): Promise<void> {
+  if (!ADJUSTERS.includes(currentUser(req).role)) {
+    res.status(403).json({ message: "You are not allowed to change approved leave." });
+    return;
+  }
+
+  const { days, reason } = req.body ?? {};
+  const newDays = Number(days);
+  const cleanReason = reason ? String(reason).trim().slice(0, 200) : "";
+  if (!Number.isInteger(newDays) || newDays < 1 || newDays > 120) {
+    res.status(400).json({ message: "Enter a whole number of working days from 1 to 120." });
+    return;
+  }
+  if (cleanReason.length < 3) {
+    res.status(400).json({ message: "Please give a reason for the change (at least 3 characters)." });
+    return;
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    const deciderId = await getEmployeeId(currentUser(req).userId);
+    await conn.beginTransaction();
+
+    const [rows] = await conn.query<RowDataPacket[]>(
+      "SELECT * FROM leave_requests WHERE request_id = ? FOR UPDATE",
+      [req.params.id]
+    );
+    const request = rows[0];
+    if (!request) {
+      await conn.rollback();
+      res.status(404).json({ message: "Request not found." });
+      return;
+    }
+    if (request.status !== "Approved") {
+      await conn.rollback();
+      res.status(409).json({ message: "Only approved leave can be changed." });
+      return;
+    }
+    if (request.employee_id === deciderId) {
+      await conn.rollback();
+      res.status(403).json({ message: "You cannot change your own leave." });
+      return;
+    }
+
+    const [roleRows] = await conn.query<RowDataPacket[]>(
+      "SELECT role FROM users WHERE employee_id = ?",
+      [request.employee_id]
+    );
+    const requesterRole: string = roleRows[0] ? roleRows[0].role : "Employee";
+    if (!(DECIDES[currentUser(req).role] || []).includes(requesterRole)) {
+      await conn.rollback();
+      res.status(403).json({ message: "You are not allowed to change this person's leave." });
+      return;
+    }
+
+    const oldDays = Number(request.number_of_days);
+    if (newDays === oldDays) {
+      await conn.rollback();
+      res.status(400).json({ message: `The leave is already ${oldDays} working days.` });
+      return;
+    }
+
+    const start = String(request.start_date).slice(0, 10);
+    const oldEnd = String(request.end_date).slice(0, 10);
+    const newEnd = endDateForDays(start, newDays);
+    if (newEnd.slice(0, 4) !== start.slice(0, 4)) {
+      await conn.rollback();
+      res.status(400).json({
+        message: "That would run past the end of the year. Ask the employee to submit a new request for the new year.",
+      });
+      return;
+    }
+
+    const year = Number(start.slice(0, 4));
+    const delta = newDays - oldDays;
+
+    const [bal] = await conn.query<RowDataPacket[]>(
+      `SELECT days_allocated, days_used FROM leave_balances
+       WHERE employee_id = ? AND leave_type_id = ? AND year = ? FOR UPDATE`,
+      [request.employee_id, request.leave_type_id, year]
+    );
+    if (!bal[0]) {
+      await conn.rollback();
+      res.status(400).json({ message: "No leave balance exists for that type and year." });
+      return;
+    }
+
+    if (delta > 0) {
+      const remaining = Number(bal[0].days_allocated) - Number(bal[0].days_used);
+      if (delta > remaining) {
+        await conn.rollback();
+        res.status(400).json({
+          message: `The employee has only ${remaining} days left for this leave type, so it can be extended by at most ${remaining} days.`,
+        });
+        return;
+      }
+      const [overlap] = await conn.query<RowDataPacket[]>(
+        `SELECT request_id FROM leave_requests
+         WHERE employee_id = ? AND request_id <> ? AND status IN ('Pending','Approved')
+           AND start_date <= ? AND end_date >= ? LIMIT 1`,
+        [request.employee_id, req.params.id, newEnd, start]
+      );
+      if (overlap[0]) {
+        await conn.rollback();
+        res.status(409).json({
+          message: "The longer leave would overlap another request from this employee.",
+        });
+        return;
+      }
+    }
+
+    await conn.query(
+      `UPDATE leave_balances SET days_used = GREATEST(days_used + ?, 0)
+       WHERE employee_id = ? AND leave_type_id = ? AND year = ?`,
+      [delta, request.employee_id, request.leave_type_id, year]
+    );
+
+    const verb = delta > 0 ? "Extended" : "Shortened";
+    const note = `${verb} from ${oldDays} to ${newDays} working days: ${cleanReason}`.slice(0, 255);
+
+    await conn.query(
+      `UPDATE leave_requests
+       SET end_date = ?, number_of_days = ?, decision_comment = ?, seen_by_employee = 0
+       WHERE request_id = ?`,
+      [newEnd, newDays, note, req.params.id]
+    );
+
+    await conn.query(
+      `INSERT INTO leave_request_adjustments
+         (request_id, adjusted_by, old_end_date, new_end_date, old_days, new_days, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [req.params.id, deciderId, oldEnd, newEnd, oldDays, newDays, cleanReason]
     );
 
     await conn.commit();
-    res.json({ message: `Request ${decision.toLowerCase()}.` });
+    res.json({
+      message: `${verb} to ${newDays} working days (ends ${newEnd}). The employee will see the change.`,
+    });
   } catch (err) {
     await conn.rollback();
     console.error(err);
@@ -478,7 +715,8 @@ export async function getNotifications(req: Request, res: Response): Promise<voi
     const employeeId = await getEmployeeId(currentUser(req).userId);
     const [rows] = await pool.query<RowDataPacket[]>(
       `SELECT r.request_id, t.type_name, r.start_date, r.end_date, r.number_of_days,
-              r.status, r.decision_comment, r.decision_date, a.full_name AS decided_by
+              r.status, r.decision_comment, r.decision_date, a.full_name AS decided_by,
+              ${REQUESTED_DAYS_SQL} AS requested_days
        FROM leave_requests r
        JOIN leave_types t ON t.leave_type_id = r.leave_type_id
        LEFT JOIN employees a ON a.employee_id = r.approved_by
@@ -495,7 +733,7 @@ export async function getNotifications(req: Request, res: Response): Promise<voi
 }
 
 export async function markNotificationsRead(req: Request, res: Response): Promise<void> {
-  const ids: unknown = req.body.ids;
+  const ids: unknown = (req.body ?? {}).ids;
   if (!Array.isArray(ids) || ids.length === 0 || !ids.every((n) => Number.isInteger(n))) {
     res.status(400).json({ message: "Nothing to mark." });
     return;
