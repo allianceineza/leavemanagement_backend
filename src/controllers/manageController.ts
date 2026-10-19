@@ -498,3 +498,80 @@ export const generateBalances = safe(async (req, res) => {
     message: `Created ${result.affectedRows} balances for ${year}. Existing balances were left unchanged.`,
   });
 });
+
+export const getOverview = safe(async (_req, res) => {
+  const [empRows] = await pool.query<RowDataPacket[]>(
+    `SELECT COUNT(*) AS total,
+            COALESCE(SUM(status = 'Active'), 0) AS active,
+            COALESCE(SUM(hire_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+                         AND hire_date <= CURDATE()), 0) AS new_hires
+     FROM employees`
+  );
+
+  const [deptRows] = await pool.query<RowDataPacket[]>(
+    `SELECT d.department_name, COUNT(e.employee_id) AS headcount
+     FROM departments d
+     LEFT JOIN employees e ON e.department_id = d.department_id AND e.status = 'Active'
+     GROUP BY d.department_id, d.department_name
+     ORDER BY headcount DESC, d.department_name`
+  );
+
+  const [leaveRows] = await pool.query<RowDataPacket[]>(
+    `SELECT
+       (SELECT COUNT(*) FROM leave_requests WHERE status = 'Pending') AS pending,
+       (SELECT COUNT(DISTINCT employee_id) FROM leave_requests
+          WHERE status = 'Approved' AND CURDATE() BETWEEN start_date AND end_date) AS on_leave_today,
+       (SELECT COUNT(DISTINCT employee_id) FROM leave_requests
+          WHERE status = 'Approved' AND start_date > CURDATE()
+            AND start_date <= DATE_ADD(CURDATE(), INTERVAL 30 DAY)) AS starting_soon,
+       (SELECT COUNT(*) FROM employees e WHERE e.status = 'Active'
+          AND NOT EXISTS (SELECT 1 FROM leave_balances b
+            WHERE b.employee_id = e.employee_id AND b.year = YEAR(CURDATE()))) AS without_balances`
+  );
+
+  const [recRows] = await pool.query<RowDataPacket[]>(
+    `SELECT
+       (SELECT COUNT(*) FROM vacancies WHERE status = 'Open') AS open_vacancies,
+       (SELECT COUNT(*) FROM vacancies
+          WHERE status = 'Open' AND closing_date IS NOT NULL
+            AND closing_date BETWEEN CURDATE() AND DATE_ADD(CURDATE(), INTERVAL 7 DAY)) AS closing_soon,
+       (SELECT COUNT(*) FROM applications a
+          JOIN vacancies v ON v.vacancy_id = a.vacancy_id
+          WHERE v.status = 'Open') AS open_applications`
+  );
+
+  const [stageRows] = await pool.query<RowDataPacket[]>(
+    `SELECT a.status, COUNT(*) AS total
+     FROM applications a JOIN vacancies v ON v.vacancy_id = a.vacancy_id
+     WHERE v.status = 'Open'
+     GROUP BY a.status`
+  );
+
+  const e = empRows[0];
+  const l = leaveRows[0];
+  const r = recRows[0];
+
+  res.json({
+    employees: {
+      total: Number(e.total),
+      active: Number(e.active),
+      new_hires: Number(e.new_hires),
+      by_department: deptRows.map((d) => ({
+        department_name: d.department_name,
+        headcount: Number(d.headcount),
+      })),
+    },
+    leave: {
+      pending: Number(l.pending),
+      on_leave_today: Number(l.on_leave_today),
+      starting_soon: Number(l.starting_soon),
+      without_balances: Number(l.without_balances),
+    },
+    recruitment: {
+      open_vacancies: Number(r.open_vacancies),
+      closing_soon: Number(r.closing_soon),
+      open_applications: Number(r.open_applications),
+      by_stage: stageRows.map((s) => ({ status: s.status, total: Number(s.total) })),
+    },
+  });
+});

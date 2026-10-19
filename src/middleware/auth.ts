@@ -34,7 +34,7 @@ export async function requireAuth(
 
   try {
     const [rows] = await pool.query<RowDataPacket[]>(
-      `SELECT u.role, e.status
+      `SELECT u.role, u.must_change_password, e.status
        FROM users u JOIN employees e ON e.employee_id = u.employee_id
        WHERE u.user_id = ?`,
       [payload.userId]
@@ -44,6 +44,18 @@ export async function requireAuth(
       res.status(401).json({ message: "This account is no longer active." });
       return;
     }
+
+    // A temporary password must be replaced before anything else is allowed
+    if (Number(row.must_change_password) === 1) {
+      const path = req.originalUrl.split("?")[0];
+      if (!path.endsWith("/auth/change-password")) {
+        res
+          .status(403)
+          .json({ message: "You must change your temporary password before continuing." });
+        return;
+      }
+    }
+
     req.user = { userId: payload.userId, role: row.role as Role };
     next();
   } catch (err) {
@@ -61,5 +73,3 @@ export function requireRole(...roles: Role[]) {
     next();
   };
 }
-
-

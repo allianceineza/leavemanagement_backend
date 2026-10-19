@@ -9,7 +9,9 @@ import {
   getAnalytics,
   getEmployees,
   generateBalances,
+  getOverview,
 } from "../controllers/manageController";
+
 const router = Router();
 
 router.use(requireAuth, requireRole("HR"));
@@ -22,5 +24,6 @@ router.get("/export/requests", exportRequests);
 router.get("/analytics", getAnalytics);
 router.get("/employees", getEmployees);
 router.post("/balances/generate", generateBalances);
-router.post("/balances/generate", generateBalances);
+router.get("/overview", getOverview);
+
 export default router;

@@ -5,10 +5,48 @@ import { pool } from "../db";
 import type { AuthedRequest } from "../middleware/auth";
 
 const STATUSES = ["Active", "Inactive", "Terminated"];
+const GENDERS = ["Male", "Female", "Other"];
+const CREATABLE_ROLES = ["Employee", "Manager"];
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
 }
+
+function orNull(value: unknown): string | null {
+  return asText(value) || null;
+}
+
+/* ---------- helpers ---------- */
+
+async function currentEmployee(userId: number): Promise<RowDataPacket | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.employee_id, e.department_id
+     FROM users u JOIN employees e ON e.employee_id = u.employee_id
+     WHERE u.user_id = ?`,
+    [userId]
+  );
+  return rows[0] ?? null;
+}
+
+async function loadEmployee(id: number): Promise<RowDataPacket | null> {
+  const [rows] = await pool.query<RowDataPacket[]>(
+    `SELECT e.employee_id, e.employee_code, e.full_name, e.email, e.phone,
+            e.national_id, e.gender, e.date_of_birth, e.address,
+            e.department_id, d.department_name, e.job_title, e.hire_date,
+            e.manager_id, m.full_name AS manager_name,
+            e.status, e.status_reason, e.created_at, e.updated_at, u.role
+     FROM employees e
+     JOIN departments d ON d.department_id = e.department_id
+     LEFT JOIN employees m ON m.employee_id = e.manager_id
+     LEFT JOIN users u ON u.employee_id = e.employee_id
+     WHERE e.employee_id = ?`,
+    [id]
+  );
+  return rows[0] ?? null;
+}
+
+/* ---------- list ---------- */
 
 export async function listEmployees(req: AuthedRequest, res: Response): Promise<void> {
   const page = Math.max(parseInt(asText(req.query.page), 10) || 1, 1);
@@ -20,13 +58,8 @@ export async function listEmployees(req: AuthedRequest, res: Response): Promise<
   try {
     // A manager can only see their own department
     if (req.user?.role === "Manager") {
-      const [me] = await pool.query<RowDataPacket[]>(
-        `SELECT e.department_id
-         FROM users u JOIN employees e ON e.employee_id = u.employee_id
-         WHERE u.user_id = ?`,
-        [req.user.userId]
-      );
-      departmentId = me[0]?.department_id ?? null;
+      const me = await currentEmployee(req.user.userId);
+      departmentId = me?.department_id ?? null;
       if (!departmentId) {
         res.json({ data: [], meta: { total: 0, page, limit, pages: 0 } });
         return;
@@ -76,13 +109,8 @@ export async function listEmployees(req: AuthedRequest, res: Response): Promise<
     res.status(500).json({ message: "Database error" });
   }
 }
-const GENDERS = ["Male", "Female", "Other"];
-const CREATABLE_ROLES = ["Employee", "Manager"];
-const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
-function orNull(value: unknown): string | null {
-  return asText(value) || null;
-}
+/* ---------- create ---------- */
 
 export async function createEmployee(req: AuthedRequest, res: Response): Promise<void> {
   const b = req.body ?? {};
@@ -138,7 +166,7 @@ export async function createEmployee(req: AuthedRequest, res: Response): Promise
       [employeeId, fullName, email, hash, role]
     );
 
-    // Same leave balances your register() gives a new person
+    // Same leave balances that register() gives a new person
     await conn.query(
       `INSERT INTO leave_balances (employee_id, leave_type_id, year, days_allocated, days_used)
        SELECT ?, leave_type_id, YEAR(CURDATE()), days_allowed_per_year, 0 FROM leave_types`,
@@ -168,32 +196,8 @@ export async function createEmployee(req: AuthedRequest, res: Response): Promise
     conn.release();
   }
 }
-async function currentEmployee(userId: number): Promise<RowDataPacket | null> {
-  const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT e.employee_id, e.department_id
-     FROM users u JOIN employees e ON e.employee_id = u.employee_id
-     WHERE u.user_id = ?`,
-    [userId]
-  );
-  return rows[0] ?? null;
-}
 
-async function loadEmployee(id: number): Promise<RowDataPacket | null> {
-  const [rows] = await pool.query<RowDataPacket[]>(
-    `SELECT e.employee_id, e.employee_code, e.full_name, e.email, e.phone,
-            e.national_id, e.gender, e.date_of_birth, e.address,
-            e.department_id, d.department_name, e.job_title, e.hire_date,
-            e.manager_id, m.full_name AS manager_name,
-            e.status, e.status_reason, e.created_at, e.updated_at, u.role
-     FROM employees e
-     JOIN departments d ON d.department_id = e.department_id
-     LEFT JOIN employees m ON m.employee_id = e.manager_id
-     LEFT JOIN users u ON u.employee_id = e.employee_id
-     WHERE e.employee_id = ?`,
-    [id]
-  );
-  return rows[0] ?? null;
-}
+/* ---------- view ---------- */
 
 export async function getMyProfile(req: AuthedRequest, res: Response): Promise<void> {
   try {
@@ -236,7 +240,7 @@ export async function getEmployee(req: AuthedRequest, res: Response): Promise<vo
         res.status(403).json({ message: "You can only view employees in your department." });
         return;
       }
-      delete emp.national_id;      // managers do not see these for other people
+      delete emp.national_id; // managers do not see these for other people
       delete emp.date_of_birth;
     }
 
@@ -246,6 +250,9 @@ export async function getEmployee(req: AuthedRequest, res: Response): Promise<vo
     res.status(500).json({ message: "Database error" });
   }
 }
+
+/* ---------- edit (HR) ---------- */
+
 const FIELD_MAP: Record<string, string> = {
   fullName: "full_name",
   email: "email",
@@ -382,6 +389,9 @@ export async function updateEmployee(req: AuthedRequest, res: Response): Promise
     conn.release();
   }
 }
+
+/* ---------- status (HR) ---------- */
+
 export async function changeEmployeeStatus(req: AuthedRequest, res: Response): Promise<void> {
   const id = parseInt(String(req.params.id), 10);
   const status = asText(req.body?.status);
@@ -458,6 +468,367 @@ export async function changeEmployeeStatus(req: AuthedRequest, res: Response): P
     );
     await conn.commit();
     res.json({ message: `Employee is now ${status}`, status });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+}
+
+/* ---------- history (HR) ---------- */
+
+const HISTORY_LABELS: Record<string, string> = {
+  full_name: "Full name",
+  email: "Email",
+  phone: "Phone",
+  national_id: "National ID",
+  gender: "Gender",
+  date_of_birth: "Date of birth",
+  address: "Address",
+  department_id: "Department",
+  job_title: "Job title",
+  hire_date: "Hire date",
+  manager_id: "Manager",
+  status: "Status",
+  reason: "Reason",
+  role: "Login role",
+};
+
+function parseJson(value: unknown): Record<string, unknown> {
+  if (typeof value !== "string" || !value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+export async function getEmployeeHistory(req: AuthedRequest, res: Response): Promise<void> {
+  const id = parseInt(String(req.params.id), 10);
+  if (!id) {
+    res.status(400).json({ message: "Invalid employee id." });
+    return;
+  }
+
+  try {
+    const [exists] = await pool.query<RowDataPacket[]>(
+      "SELECT employee_id FROM employees WHERE employee_id = ?",
+      [id]
+    );
+    if (!exists[0]) {
+      res.status(404).json({ message: "Employee not found." });
+      return;
+    }
+
+    const [rows] = await pool.query<RowDataPacket[]>(
+      `SELECT h.id, h.change_type, h.old_values, h.new_values, h.changed_at,
+              u.full_name AS changed_by_name
+       FROM employee_history h
+       LEFT JOIN users u ON u.user_id = h.changed_by
+       WHERE h.employee_id = ?
+       ORDER BY h.changed_at DESC, h.id DESC`,
+      [id]
+    );
+
+    const parsed = rows.map((r) => ({
+      row: r,
+      oldV: parseJson(r.old_values),
+      newV: parseJson(r.new_values),
+    }));
+
+    // Look up names so the history shows "IT" and a person's name, not 3 and 1
+    const managerIds = new Set<number>();
+    for (const p of parsed) {
+      for (const v of [p.oldV.manager_id, p.newV.manager_id]) {
+        const n = Number(v);
+        if (n) managerIds.add(n);
+      }
+    }
+    const managerNames = new Map<number, string>();
+    if (managerIds.size) {
+      const [emps] = await pool.query<RowDataPacket[]>(
+        "SELECT employee_id, full_name FROM employees WHERE employee_id IN (?)",
+        [[...managerIds]]
+      );
+      for (const e of emps) managerNames.set(e.employee_id, e.full_name);
+    }
+    const departmentNames = new Map<number, string>();
+    const [deptRows] = await pool.query<RowDataPacket[]>(
+      "SELECT department_id, department_name FROM departments"
+    );
+    for (const d of deptRows) departmentNames.set(d.department_id, d.department_name);
+
+    const show = (key: string, value: unknown): string => {
+      if (value === null || value === undefined || value === "") return "(empty)";
+      if (key === "department_id") return departmentNames.get(Number(value)) ?? String(value);
+      if (key === "manager_id") return managerNames.get(Number(value)) ?? String(value);
+      return String(value);
+    };
+
+    const data = parsed.map(({ row, oldV, newV }) => ({
+      id: row.id,
+      change_type: row.change_type,
+      changed_at: row.changed_at,
+      changed_by: row.changed_by_name ?? "Unknown",
+      changes:
+        row.change_type === "created"
+          ? []
+          : Object.keys(newV).map((key) => ({
+              field: HISTORY_LABELS[key] ?? key,
+              from: show(key, oldV[key]),
+              to: show(key, newV[key]),
+            })),
+    }));
+
+    res.json({ data });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: "Database error" });
+  }
+}
+
+/* ---------- self-edit (any logged-in employee) ---------- */
+
+export async function updateMyProfile(req: AuthedRequest, res: Response): Promise<void> {
+  const b = req.body ?? {};
+  const updates: Record<string, string | null> = {};
+
+  if (b.phone !== undefined) {
+    const phone = asText(b.phone);
+    if (phone && !/^[0-9+\-\s()]{7,30}$/.test(phone)) {
+      res.status(400).json({ message: "Invalid phone number." });
+      return;
+    }
+    updates.phone = phone || null;
+  }
+  if (b.address !== undefined) {
+    const address = asText(b.address);
+    if (address.length > 255) {
+      res.status(400).json({ message: "Address must be 255 characters or fewer." });
+      return;
+    }
+    updates.address = address || null;
+  }
+  if (!Object.keys(updates).length) {
+    res.status(400).json({ message: "Nothing to update." });
+    return;
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    const me = await currentEmployee(req.user!.userId);
+    if (!me) {
+      res.status(404).json({ message: "No employee profile is linked to this account." });
+      return;
+    }
+
+    const [found] = await conn.query<RowDataPacket[]>(
+      "SELECT phone, address FROM employees WHERE employee_id = ?",
+      [me.employee_id]
+    );
+    const before = found[0];
+
+    const oldV: Record<string, unknown> = {};
+    const newV: Record<string, string | null> = {};
+    for (const [col, val] of Object.entries(updates)) {
+      if (String(before[col] ?? "") !== String(val ?? "")) {
+        oldV[col] = before[col] ?? null;
+        newV[col] = val;
+      }
+    }
+    const changed = Object.keys(newV);
+    if (!changed.length) {
+      res.json({ message: "No changes", changed: [] });
+      return;
+    }
+
+    await conn.beginTransaction();
+    await conn.query(
+      `UPDATE employees SET ${changed.map((c) => `${c} = ?`).join(", ")} WHERE employee_id = ?`,
+      [...changed.map((c) => newV[c]), me.employee_id]
+    );
+    await conn.query(
+      "INSERT INTO employee_history (employee_id, change_type, old_values, new_values, changed_by) VALUES (?, 'updated', ?, ?, ?)",
+      [me.employee_id, JSON.stringify(oldV), JSON.stringify(newV), req.user!.userId]
+    );
+    await conn.commit();
+    res.json({ message: "Your details were updated", changed });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+}
+/* ---------- role change and password reset (HR) ---------- */
+
+const MANAGED_ROLES = ["Employee", "Manager"];
+
+async function findManagedLogin(
+  employeeId: number
+): Promise<{ error?: { status: number; message: string }; role?: string }> {
+  const [found] = await pool.query<RowDataPacket[]>(
+    "SELECT role FROM users WHERE employee_id = ?",
+    [employeeId]
+  );
+  const target = found[0];
+  if (!target) {
+    return { error: { status: 404, message: "This employee has no login account." } };
+  }
+  if (!MANAGED_ROLES.includes(target.role)) {
+    return {
+      error: {
+        status: 403,
+        message: "HR and Chief accounts cannot be changed here.",
+      },
+    };
+  }
+  return { role: target.role as string };
+}
+
+export async function changeEmployeeRole(req: AuthedRequest, res: Response): Promise<void> {
+  const id = parseInt(String(req.params.id), 10);
+  const role = asText(req.body?.role);
+
+  if (!id) {
+    res.status(400).json({ message: "Invalid employee id." });
+    return;
+  }
+  if (!MANAGED_ROLES.includes(role)) {
+    res.status(400).json({
+      message: "Role must be Employee or Manager. HR and Chief accounts use a registration code.",
+    });
+    return;
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    const target = await findManagedLogin(id);
+    if (target.error) {
+      res.status(target.error.status).json({ message: target.error.message });
+      return;
+    }
+    if (target.role === role) {
+      res.json({ message: "No changes", role });
+      return;
+    }
+
+    await conn.beginTransaction();
+    await conn.query("UPDATE users SET role = ? WHERE employee_id = ?", [role, id]);
+    await conn.query(
+      "INSERT INTO employee_history (employee_id, change_type, old_values, new_values, changed_by) VALUES (?, 'role_changed', ?, ?, ?)",
+      [id, JSON.stringify({ role: target.role }), JSON.stringify({ role }), req.user?.userId ?? null]
+    );
+    await conn.commit();
+    res.json({ message: `Login role is now ${role}`, role });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+}
+
+export async function resetEmployeePassword(req: AuthedRequest, res: Response): Promise<void> {
+  const id = parseInt(String(req.params.id), 10);
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+
+  if (!id) {
+    res.status(400).json({ message: "Invalid employee id." });
+    return;
+  }
+  if (password.length < 8) {
+    res.status(400).json({ message: "The new password must be at least 8 characters." });
+    return;
+  }
+  if (password.length > 72) {
+    res.status(400).json({ message: "The new password must be 72 characters or fewer." });
+    return;
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    const target = await findManagedLogin(id);
+    if (target.error) {
+      res.status(target.error.status).json({ message: target.error.message });
+      return;
+    }
+
+    const hash = await bcrypt.hash(password, 10);
+
+    await conn.beginTransaction();
+    await conn.query("UPDATE users SET password_hash = ? WHERE employee_id = ?", [hash, id]);
+    await conn.query(
+      "INSERT INTO employee_history (employee_id, change_type, old_values, new_values, changed_by) VALUES (?, 'password_reset', NULL, NULL, ?)",
+      [id, req.user?.userId ?? null]
+    );
+    await conn.commit();
+    res.json({ message: "Password reset. Share the new password with the employee yourself." });
+  } catch (err) {
+    await conn.rollback();
+    console.error(err);
+    res.status(500).json({ message: "Database error" });
+  } finally {
+    conn.release();
+  }
+}
+/* ---------- change my own password (any logged-in user) ---------- */
+
+export async function changeMyPassword(req: AuthedRequest, res: Response): Promise<void> {
+  const current = typeof req.body?.currentPassword === "string" ? req.body.currentPassword : "";
+  const next = typeof req.body?.newPassword === "string" ? req.body.newPassword : "";
+
+  if (!current || !next) {
+    res.status(400).json({ message: "Enter your current password and a new password." });
+    return;
+  }
+  if (next.length < 8) {
+    res.status(400).json({ message: "The new password must be at least 8 characters." });
+    return;
+  }
+  if (next.length > 72) {
+    res.status(400).json({ message: "The new password must be 72 characters or fewer." });
+    return;
+  }
+  if (next === current) {
+    res.status(400).json({ message: "The new password must be different from the current one." });
+    return;
+  }
+
+  const conn = await pool.getConnection();
+  try {
+    const [rows] = await conn.query<RowDataPacket[]>(
+      "SELECT employee_id, password_hash FROM users WHERE user_id = ?",
+      [req.user!.userId]
+    );
+    const user = rows[0];
+    if (!user) {
+      res.status(404).json({ message: "Account not found." });
+      return;
+    }
+
+    // 400, not 401: the frontend logs people out on 401, and a typo should not do that
+    const ok = await bcrypt.compare(current, user.password_hash);
+    if (!ok) {
+      res.status(400).json({ message: "Your current password is wrong." });
+      return;
+    }
+
+    const hash = await bcrypt.hash(next, 10);
+
+    await conn.beginTransaction();
+    await conn.query("UPDATE users SET password_hash = ? WHERE user_id = ?", [hash, req.user!.userId]);
+    await conn.query(
+      "INSERT INTO employee_history (employee_id, change_type, old_values, new_values, changed_by) VALUES (?, 'password_changed', NULL, NULL, ?)",
+      [user.employee_id, req.user!.userId]
+    );
+    await conn.commit();
+    res.json({ message: "Your password was changed." });
   } catch (err) {
     await conn.rollback();
     console.error(err);
