@@ -11,6 +11,8 @@ import recruitmentRoutes from "./routes/recruitmentRoutes";
 import payrollRoutes from "./routes/payrollRoutes";
 import settingsRoutes from "./routes/settingsRoutes";
 import awardRoutes from "./routes/awardRoutes";
+import activityRoutes from "./routes/activityRoutes";
+import wellnessRoutes from "./routes/wellnessRoutes";
 
 if (!process.env.JWT_SECRET) {
   throw new Error("JWT_SECRET is missing in the .env file");
@@ -29,6 +31,8 @@ app.use("/api/recruitment", recruitmentRoutes);
 app.use("/api/payroll", payrollRoutes);
 app.use("/api/settings", settingsRoutes);
 app.use("/api/awards", awardRoutes);
+app.use("/api/wellness", wellnessRoutes);
+app.use("/api/activities", activityRoutes);
 // Any unexpected error returns a clear message instead of an empty page
 app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
   console.error(err);

@@ -24,7 +24,7 @@ router.post("/types", requireRole("HR"), createAwardType);
 router.put("/types/:id", requireRole("HR"), updateAwardType);
 
 // All awards (a manager sees their own department only)
-router.get("/", requireRole("HR", "Chief", "Manager"), listAwards);
+router.get("/types", requireRole("HR", "Chief", "Manager"), listAwardTypes);
 
 // Giving, correcting and removing awards (HR)
 router.post("/", requireRole("HR"), createAward);
